@@ -8,6 +8,10 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// ==========================================
+// MIDDLEWARE
+// ==========================================
+
 app.use(cors());
 
 app.use(
@@ -15,6 +19,10 @@ app.use(
     limit: "15mb",
   })
 );
+
+// ==========================================
+// GEMINI API KEY
+// ==========================================
 
 if (!process.env.GEMINI_API_KEY) {
   console.error("GEMINI_API_KEY is missing in .env");
@@ -41,7 +49,7 @@ app.get("/", (req, res) => {
 });
 
 // ==========================================
-// HELPER
+// HELPERS
 // ==========================================
 
 function getBase64Image(image) {
@@ -55,13 +63,83 @@ function cleanAIResponse(text) {
     .trim();
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ==========================================
+// GEMINI RETRY SYSTEM
+// 503 немесе 429 болса автоматты қайта көреді
+// ==========================================
+
+async function generateWithRetry(options, label = "Gemini") {
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      console.log(
+        `${label}: Gemini request ${attempt}/${maxAttempts}`
+      );
+
+      const response = await ai.models.generateContent(options);
+
+      return response;
+    } catch (error) {
+      const message = String(error?.message || "");
+      const status = Number(error?.status || error?.code || 0);
+
+      console.error(
+        `${label}: Gemini attempt ${attempt} failed:`,
+        message
+      );
+
+      const temporaryError =
+        status === 503 ||
+        status === 429 ||
+        message.includes("503") ||
+        message.includes("429") ||
+        message.includes("UNAVAILABLE") ||
+        message.toLowerCase().includes("high demand") ||
+        message.toLowerCase().includes("resource exhausted");
+
+      // Уақытша қате болмаса, қайта күтпейміз
+      if (!temporaryError) {
+        throw error;
+      }
+
+      // Соңғы әрекет те сәтсіз болса
+      if (attempt === maxAttempts) {
+        throw error;
+      }
+
+      // 1-реттен кейін 1.5 сек
+      // 2-реттен кейін 3 сек
+      const waitTime = attempt * 1500;
+
+      console.log(
+        `${label}: Gemini temporarily unavailable. ` +
+          `Retrying in ${waitTime}ms...`
+      );
+
+      await sleep(waitTime);
+    }
+  }
+
+  throw new Error("Gemini request failed.");
+}
+
 // ==========================================
 // VISIONGLISH — ENGLISH
+// POST /api/discover
 // ==========================================
 
 app.post("/api/discover", async (req, res) => {
   try {
     const { image } = req.body;
+
+    // --------------------------------------
+    // IMAGE CHECK
+    // --------------------------------------
 
     if (!image) {
       return res.status(400).json({
@@ -71,6 +149,10 @@ app.post("/api/discover", async (req, res) => {
     }
 
     const base64Image = getBase64Image(image);
+
+    // --------------------------------------
+    // ENGLISH PROMPT
+    // --------------------------------------
 
     const prompt = `
 You are the AI Vision system of an English learning platform
@@ -110,25 +192,51 @@ Return exactly this structure:
   "question": "What color is your pen?",
   "confidence": 96
 }
+
+If no clear object is visible, return:
+
+{
+  "recognized": false,
+  "object": "",
+  "article": "",
+  "definition": "",
+  "example": "",
+  "question": "",
+  "confidence": 0
+}
 `;
 
+    console.log("");
+    console.log("========================================");
     console.log("VISIONGLISH: Analyzing camera image...");
+    console.log("========================================");
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash-lite",
+    // --------------------------------------
+    // GEMINI + RETRY
+    // --------------------------------------
 
-      contents: [
-        {
-          inlineData: {
-            mimeType: "image/jpeg",
-            data: base64Image,
+    const response = await generateWithRetry(
+      {
+        model: "gemini-3.5-flash-lite",
+
+        contents: [
+          {
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: base64Image,
+            },
           },
-        },
-        {
-          text: prompt,
-        },
-      ],
-    });
+          {
+            text: prompt,
+          },
+        ],
+      },
+      "VISIONGLISH"
+    );
+
+    // --------------------------------------
+    // RESPONSE
+    // --------------------------------------
 
     const text = response.text?.trim();
 
@@ -145,7 +253,10 @@ Return exactly this structure:
     try {
       result = JSON.parse(cleanedText);
     } catch {
-      console.error("Invalid English JSON:", cleanedText);
+      console.error(
+        "Invalid English JSON:",
+        cleanedText
+      );
 
       return res.status(500).json({
         success: false,
@@ -153,12 +264,33 @@ Return exactly this structure:
       });
     }
 
+    if (typeof result.recognized !== "boolean") {
+      result.recognized = Boolean(result.object);
+    }
+
     return res.json({
       success: true,
       ...result,
     });
   } catch (error) {
+    console.error("");
     console.error("VISIONGLISH ERROR:", error);
+
+    const message = String(error?.message || "");
+
+    const temporaryError =
+      message.includes("503") ||
+      message.includes("429") ||
+      message.includes("UNAVAILABLE") ||
+      message.toLowerCase().includes("high demand");
+
+    if (temporaryError) {
+      return res.status(503).json({
+        success: false,
+        error:
+          "AI is temporarily busy. Please try again in a few seconds.",
+      });
+    }
 
     return res.status(500).json({
       success: false,
@@ -171,11 +303,16 @@ Return exactly this structure:
 
 // ==========================================
 // SÖZTAP — ҚАЗАҚ ТІЛІ
+// POST /api/discover-kz
 // ==========================================
 
 app.post("/api/discover-kz", async (req, res) => {
   try {
     const { image } = req.body;
+
+    // --------------------------------------
+    // СУРЕТТІ ТЕКСЕРУ
+    // --------------------------------------
 
     if (!image) {
       return res.status(400).json({
@@ -185,6 +322,10 @@ app.post("/api/discover-kz", async (req, res) => {
     }
 
     const base64Image = getBase64Image(image);
+
+    // --------------------------------------
+    // ҚАЗАҚША PROMPT
+    // --------------------------------------
 
     const prompt = `
 Сен қазақ тілін үйретуге арналған SÖZTAP білім беру
@@ -270,23 +411,37 @@ app.post("/api/discover-kz", async (req, res) => {
 }
 `;
 
+    console.log("");
+    console.log("========================================");
     console.log("SOZTAP: Камерадағы зат талдануда...");
+    console.log("========================================");
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.5-flash-lite",
+    // --------------------------------------
+    // GEMINI + RETRY
+    // --------------------------------------
 
-      contents: [
-        {
-          inlineData: {
-            mimeType: "image/jpeg",
-            data: base64Image,
+    const response = await generateWithRetry(
+      {
+        model: "gemini-3.5-flash-lite",
+
+        contents: [
+          {
+            inlineData: {
+              mimeType: "image/jpeg",
+              data: base64Image,
+            },
           },
-        },
-        {
-          text: prompt,
-        },
-      ],
-    });
+          {
+            text: prompt,
+          },
+        ],
+      },
+      "SOZTAP"
+    );
+
+    // --------------------------------------
+    // RESPONSE
+    // --------------------------------------
 
     const text = response.text?.trim();
 
@@ -303,7 +458,10 @@ app.post("/api/discover-kz", async (req, res) => {
     try {
       result = JSON.parse(cleanedText);
     } catch {
-      console.error("Invalid Kazakh JSON:", cleanedText);
+      console.error(
+        "Invalid Kazakh JSON:",
+        cleanedText
+      );
 
       return res.status(500).json({
         success: false,
@@ -320,7 +478,24 @@ app.post("/api/discover-kz", async (req, res) => {
       ...result,
     });
   } catch (error) {
+    console.error("");
     console.error("SOZTAP ERROR:", error);
+
+    const message = String(error?.message || "");
+
+    const temporaryError =
+      message.includes("503") ||
+      message.includes("429") ||
+      message.includes("UNAVAILABLE") ||
+      message.toLowerCase().includes("high demand");
+
+    if (temporaryError) {
+      return res.status(503).json({
+        success: false,
+        error:
+          "Жасанды интеллект қазір бос емес. Бірнеше секундтан кейін қайта байқап көріңіз.",
+      });
+    }
 
     return res.status(500).json({
       success: false,
@@ -343,6 +518,8 @@ app.listen(PORT, () => {
   console.log("");
   console.log(" EN: /api/discover");
   console.log(" KZ: /api/discover-kz");
+  console.log("");
+  console.log(" Gemini retry system: ON");
   console.log("========================================");
   console.log("");
 });
